@@ -3,17 +3,23 @@
 #include <string>
 #include <regex>
 #include <vector>
+#include <unordered_map>
 #include "http.hpp"
 
+using route_handler = std::function<void(const HttpRequest*, HttpRespond*, std::unordered_map<std::string, std::string>&)>;
+
+struct Route {
+    std::string method;
+    std::regex pattern;
+    std::vector<std::string> params;
+    route_handler handler;
+};
+
 class Router {
-    struct Route {
-        std::string method;
-        std::string url_regex;
-        void (*handler)(HttpRequest* req, HttpRespond* res);
-    };
-    std::vector<Route> route_list; 
+private:
+    std::vector<Route> routes_;
 
 public:
-    void register_route(std::string url, std::string m, void (*handler)(HttpRequest* req, HttpRespond* res));
-    void request_route(HttpRequest* req, HttpRespond* res);
+    void add(const std::string& method, const std::string& pattern, const route_handler& handler);
+    bool match(const std::string& method, const std::string& url, Route &matched, std::unordered_map<std::string, std::string> &params);
 };

@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <chrono>
 #include "http.hpp"
+#include "router.hpp"
 
 constexpr static int MaxBufferSize = 10000;
 
@@ -34,7 +35,9 @@ private:
     int socket_fd_;
     sockaddr_in server_info_;
     bool active_;
+    Router router_;
 
+    EventInfo* handle_httpdata(EventInfo *data);
     void server_listen(void);
     void process_epoll_event(int epfd, EventInfo *data, epoll_event ev);
     void process_event(int worker_id);
@@ -55,6 +58,7 @@ public:
 
     void start();
     void stop();
+    void add(const std::string& method, const std::string& pattern, const route_handler& call_back);
     std::uint16_t get_port() const {return port_;}
     std::string get_host() const {return host_;}
     int get_sockfd() const {return socket_fd_;}

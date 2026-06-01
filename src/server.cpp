@@ -2,26 +2,6 @@
 
 using namespace std;
 
-HttpRespond handleRequest(const HttpRequest& req) {
-    HttpRespond res;
-    if (req.method == "GET" && req.path == "/") {
-        res.status_code = 200;
-        res.status_text = "OK";
-        res.body = "{\"message\":\"Welcome to the blog API\"}";
-    }
-    else if (req.method == "GET" && req.path == "/api/posts") {
-        res.status_code = 200;
-        res.status_text = "OK";
-        res.body = "[{\"id\":1,\"title\":\"First Post\"}]";
-    }
-    else {
-        res.status_code = 404;
-        res.status_text = "Not Found";
-        res.body = "{\"error\":\"Not Found\"}";
-    }
-    return res;
-}
-
 HttpRequest parseRequest(const string& raw) {
     HttpRequest r;
     stringstream ss(raw);
@@ -35,7 +15,31 @@ HttpServer::HttpServer(const std::string& host, const int port)
     , socket_fd_(0)
     , server_info_()
     , active_(true)
+    , router_()
     {}
+
+EventInfo* HttpServer::handle_httpdata(EventInfo* data) {
+    HttpRequest req = parseRequest(data->buffer);
+    Route matched;
+    std::unordered_map<std::string, std::string> params;
+
+    HttpRespond res;
+    if (router_.match(req.method, req.path, matched, params)) {
+        matched.handler(&req, &res, params);
+    }
+    else {
+        res.status_code = 404;
+        res.status_text = "Not Found";
+        res.body = "{\"error\":\"Not Found\"}";
+    }
+    strncpy(data->buffer, res.toString().c_str(), res.toString().size());
+    data->total = res.toString().size();
+    return data;
+}
+
+void HttpServer::add(const std::string& method, const std::string& pattern, const route_handler& call_back) {
+    router_.add(method, pattern, call_back);
+}
 
 void HttpServer::handle_epoll_ctrl(int epfd, int op, int fd, void* info, uint32_t event_type) {
     if (op == EPOLL_CTL_DEL) {
@@ -93,10 +97,7 @@ void HttpServer::process_epoll_event(int epfd, EventInfo *data, epoll_event ev) 
             delete data;
         }
         else {
-            HttpRespond r = handleRequest(parseRequest(data->buffer));
-            string s = r.toString();
-            strncpy(data->buffer, s.c_str(), s.size());
-            data->total = s.size();
+            data = handle_httpdata(data);
             
             handle_epoll_ctrl(epfd, EPOLL_CTL_MOD, fd, data, EPOLLOUT);
         }
