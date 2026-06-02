@@ -17,6 +17,14 @@ int main() {
         res->body = "{\"id\": \"" + params["id"] + "\"}";
     });
 
+    server.use([](const HttpRequest* req, HttpRespond* res, next_func next) {
+        auto start = std::chrono::steady_clock::now();
+        next();
+        auto end = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        // std::cout << "Elapsed time: " << elapsed.count() << " ms\n";
+    });
+
     server.start();
 
     std::string input;

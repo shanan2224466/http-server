@@ -14,9 +14,25 @@ HttpServer::HttpServer(const std::string& host, const int port)
     , host_(host)
     , socket_fd_(0)
     , server_info_()
-    , active_(true)
+    , active_(false)
     , router_()
     {}
+
+void HttpServer::use(middleware middle) {
+    if (active_) throw runtime_error("call use() after start().");
+    middlewares_.push_back(middle);
+}
+
+void HttpServer::execution_chain(int index, const HttpRequest* req, HttpRespond* res, const route_handler& handler, std::unordered_map<std::string, std::string>& params) {
+    if (index == middlewares_.size()) {
+        handler(req, res, params);
+    }
+    else {
+        middlewares_[index](req, res, [&]() {
+            execution_chain(index + 1, req, res, handler, params);
+        });
+    }
+}
 
 EventInfo* HttpServer::handle_httpdata(EventInfo* data) {
     HttpRequest req = parseRequest(data->buffer);
@@ -25,15 +41,17 @@ EventInfo* HttpServer::handle_httpdata(EventInfo* data) {
 
     HttpRespond res;
     if (router_.match(req.method, req.path, matched, params)) {
-        matched.handler(&req, &res, params);
+        execution_chain(0, &req, &res, matched.handler, params);
     }
     else {
         res.status_code = 404;
         res.status_text = "Not Found";
         res.body = "{\"error\":\"Not Found\"}";
     }
-    strncpy(data->buffer, res.toString().c_str(), res.toString().size());
-    data->total = res.toString().size();
+    string s = res.toString();
+    strncpy(data->buffer, s.c_str(), MaxBufferSize - data->total - 1);
+    data->buffer[MaxBufferSize - 1] = '\0';
+    data->total += s.size();
     return data;
 }
 
@@ -79,7 +97,7 @@ void HttpServer::server_listen() {
 void HttpServer::process_epoll_event(int epfd, EventInfo *data, epoll_event ev) {
     int fd = data->fd;
     if (ev.events & EPOLLIN) {
-        ssize_t bytes_read = read(fd, data->buffer, MaxBufferSize - 1);
+        ssize_t bytes_read = read(fd, data->buffer + data->cursor, MaxBufferSize - 1);
         if (bytes_read < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 data->fd = fd;
@@ -103,9 +121,9 @@ void HttpServer::process_epoll_event(int epfd, EventInfo *data, epoll_event ev) 
         }
     }
     else if (ev.events & EPOLLOUT) {
-        ssize_t bytes_written = write(fd, data->buffer, data->total);
+        ssize_t bytes_written = write(fd, data->buffer + data->cursor, data->total);
         if (data->total > bytes_written) {
-            data->read += bytes_written;
+            data->cursor += bytes_written;
             data->total -= bytes_written;
             handle_epoll_ctrl(epfd, EPOLL_CTL_MOD, fd, data, EPOLLOUT);
         }
@@ -179,6 +197,7 @@ void HttpServer::setup_server() {
 }
 
 void HttpServer::start() {
+    active_ = true;
     HttpServer::setup_server();
     for (int i = 0; i < ThreadPoolSize; i++) {
         if ((worker_epoll_fd_[i] = epoll_create1(0)) < 0) {

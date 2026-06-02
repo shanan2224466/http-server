@@ -17,10 +17,13 @@
 
 constexpr static int MaxBufferSize = 10000;
 
+using next_func = std::function<void()>;
+using middleware = std::function<void(const HttpRequest*, HttpRespond*, next_func)>;
+
 struct EventInfo {
-    EventInfo() : fd(0), read(0), total(0), buffer() {}
+    EventInfo() : fd(0), cursor(0), total(0), buffer() {}
     int fd;
-    int read;
+    int cursor;
     int total;
     char buffer[MaxBufferSize];
 };
@@ -36,7 +39,10 @@ private:
     sockaddr_in server_info_;
     bool active_;
     Router router_;
+    std::vector<middleware> middlewares_;
 
+    void execution_chain(int index, const HttpRequest* req, HttpRespond* res, 
+    const route_handler& handler, std::unordered_map<std::string, std::string>& params);
     EventInfo* handle_httpdata(EventInfo *data);
     void server_listen(void);
     void process_epoll_event(int epfd, EventInfo *data, epoll_event ev);
@@ -58,6 +64,7 @@ public:
 
     void start();
     void stop();
+    void use(middleware middle);
     void add(const std::string& method, const std::string& pattern, const route_handler& call_back);
     std::uint16_t get_port() const {return port_;}
     std::string get_host() const {return host_;}
