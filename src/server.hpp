@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <unordered_map>
 #include <chrono>
+#include <mutex>
 #include "http.hpp"
 #include "router.hpp"
 
@@ -21,10 +22,12 @@ using next_func = std::function<void()>;
 using middleware = std::function<void(const HttpRequest*, HttpRespond*, next_func)>;
 
 struct EventInfo {
-    EventInfo() : fd(0), cursor(0), total(0), buffer() {}
+    EventInfo() : fd(0), cursor(0), total(0), keep_alive(true), last_active(std::chrono::steady_clock::now()), buffer() {}
     int fd;
     int cursor;
     int total;
+    bool keep_alive;
+    std::chrono::steady_clock::time_point last_active;
     char buffer[MaxBufferSize];
 };
 
@@ -39,14 +42,17 @@ private:
     sockaddr_in server_info_;
     bool active_;
     Router router_;
+    std::mutex worker_mutex[ThreadPoolSize];
     std::vector<middleware> middlewares_;
+    std::vector<EventInfo*> worker_connections_[ThreadPoolSize];
 
     void execution_chain(int index, const HttpRequest* req, HttpRespond* res, 
     const route_handler& handler, std::unordered_map<std::string, std::string>& params);
     EventInfo* handle_httpdata(EventInfo *data);
     void server_listen(void);
-    void process_epoll_event(int epfd, EventInfo *data, epoll_event ev);
+    void process_epoll_event(int epfd, EventInfo *data, epoll_event ev, int worker_id);
     void process_event(int worker_id);
+    void delete_fd(int fd, int worker_id);
     void handle_epoll_ctrl(int epfd, int op, int fd, void* = nullptr, uint32_t event_type = 0);
     void setup_server();
 

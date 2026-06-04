@@ -6,6 +6,21 @@ HttpRequest parseRequest(const string& raw) {
     HttpRequest r;
     stringstream ss(raw);
     ss >> r.method >> r.path >> r.version;
+    // parse headers: each "Key: Value\r\n" line until the blank line
+    string line;
+    getline(ss, line); // consume rest of request-line
+    while (getline(ss, line)) {
+        if (line == "\r" || line.empty()) break;
+        auto colon = line.find(':');
+        if (colon == string::npos) continue;
+        string key   = line.substr(0, colon);
+        string value = line.substr(colon + 1);
+        // trim leading spaces and trailing \r
+        auto start = value.find_first_not_of(' ');
+        if (start != string::npos) value = value.substr(start);
+        if (!value.empty() && value.back() == '\r') value.pop_back();
+        r.headers[key] = value;
+    }
     return r;
 }
 
@@ -39,6 +54,11 @@ EventInfo* HttpServer::handle_httpdata(EventInfo* data) {
     Route matched;
     std::unordered_map<std::string, std::string> params;
 
+    // honour Connection: close sent by client
+    auto conn_it = req.headers.find("Connection");
+    bool keep_alive = !(conn_it != req.headers.end() && conn_it->second == "close");
+    data->keep_alive = keep_alive;
+
     HttpRespond res;
     if (router_.match(req.method, req.path, matched, params)) {
         execution_chain(0, &req, &res, matched.handler, params);
@@ -48,7 +68,7 @@ EventInfo* HttpServer::handle_httpdata(EventInfo* data) {
         res.status_text = "Not Found";
         res.body = "{\"error\":\"Not Found\"}";
     }
-    string s = res.toString();
+    string s = res.toString(keep_alive);
     strncpy(data->buffer, s.c_str(), MaxBufferSize - data->total - 1);
     data->buffer[MaxBufferSize - 1] = '\0';
     data->total += s.size();
@@ -57,6 +77,20 @@ EventInfo* HttpServer::handle_httpdata(EventInfo* data) {
 
 void HttpServer::add(const std::string& method, const std::string& pattern, const route_handler& call_back) {
     router_.add(method, pattern, call_back);
+}
+
+void HttpServer::delete_fd(int fd, int worker_id) {
+    worker_mutex[worker_id].lock();
+    auto it = worker_connections_[worker_id].begin();
+    while (it != worker_connections_[worker_id].end()) {
+        if ((*it)->fd == fd) {
+            it = worker_connections_[worker_id].erase(it);
+        }
+        else {
+            ++it;
+        }
+    }
+    worker_mutex[worker_id].unlock();
 }
 
 void HttpServer::handle_epoll_ctrl(int epfd, int op, int fd, void* info, uint32_t event_type) {
@@ -75,27 +109,10 @@ void HttpServer::handle_epoll_ctrl(int epfd, int op, int fd, void* info, uint32_
     }
 }
 
-void HttpServer::server_listen() {
-    sockaddr_in client_addr;
-    socklen_t client_addr_len = sizeof(client_addr);
-    int current_worker = 0;
-
-    while (active_) {
-        int client_fd = accept(socket_fd_, (sockaddr *)&client_addr, &client_addr_len);
-        if (client_fd < 0) {
-            std::this_thread::sleep_for(std::chrono::microseconds(1000));
-            continue;
-        }
-
-        EventInfo *client = new EventInfo();
-        client->fd = client_fd;
-        handle_epoll_ctrl(worker_epoll_fd_[current_worker], EPOLL_CTL_ADD, client_fd, client, EPOLLIN);
-        current_worker = (current_worker + 1) % ThreadPoolSize;
-    }
-}
-
-void HttpServer::process_epoll_event(int epfd, EventInfo *data, epoll_event ev) {
+void HttpServer::process_epoll_event(int epfd, EventInfo *data, epoll_event ev, int worker_id) {
     int fd = data->fd;
+    cout << "Request on fd = " << fd << endl;
+    data->last_active = std::chrono::steady_clock::now();
     if (ev.events & EPOLLIN) {
         ssize_t bytes_read = read(fd, data->buffer + data->cursor, MaxBufferSize - 1);
         if (bytes_read < 0) {
@@ -105,6 +122,7 @@ void HttpServer::process_epoll_event(int epfd, EventInfo *data, epoll_event ev) 
             }
             else {
                 close(fd);
+                delete_fd(fd, worker_id);
                 delete data;
                 if (errno != ECONNRESET) cerr << "read error: " << strerror(errno) << endl;
             }
@@ -112,6 +130,7 @@ void HttpServer::process_epoll_event(int epfd, EventInfo *data, epoll_event ev) 
         else if (bytes_read == 0) {
             handle_epoll_ctrl(epfd, EPOLL_CTL_DEL, fd);
             close(fd);
+            delete_fd(fd, worker_id);
             delete data;
         }
         else {
@@ -128,41 +147,96 @@ void HttpServer::process_epoll_event(int epfd, EventInfo *data, epoll_event ev) 
             handle_epoll_ctrl(epfd, EPOLL_CTL_MOD, fd, data, EPOLLOUT);
         }
         else if (data->total == bytes_written) {
-            EventInfo *client = new EventInfo();
-            client->fd = fd;
-            handle_epoll_ctrl(epfd, EPOLL_CTL_MOD, fd, client, EPOLLIN);
-            delete data;
+            if (!data->keep_alive) {
+                handle_epoll_ctrl(epfd, EPOLL_CTL_DEL, fd);
+                close(fd);
+                delete_fd(fd, worker_id);
+                delete data;
+            } else {
+                data->cursor = 0;
+                data->total = 0;
+                data->keep_alive = true;
+                data->last_active = std::chrono::steady_clock::now();
+                memset(data->buffer, 0, MaxBufferSize);
+                handle_epoll_ctrl(epfd, EPOLL_CTL_MOD, fd, data, EPOLLIN);
+            }
         }
         else {
             handle_epoll_ctrl(epfd, EPOLL_CTL_DEL, fd);
             close(fd);
+            delete_fd(fd, worker_id);
             delete data;
         }
     }
     else {
         close(fd);
+        delete_fd(fd, worker_id);
         delete data;
+    }
+}
+
+void HttpServer::server_listen() {
+    sockaddr_in client_addr;
+    socklen_t client_addr_len = sizeof(client_addr);
+    int current_worker = 0;
+
+    while (active_) {
+        int client_fd = accept(socket_fd_, (sockaddr *)&client_addr, &client_addr_len);
+        cout << "New connection: fd = " << client_fd << endl;
+        if (client_fd < 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(1000));
+            continue;
+        }
+
+        EventInfo *client = new EventInfo();
+        client->fd = client_fd;
+        worker_mutex[current_worker].lock();
+        worker_connections_[current_worker].push_back(client);
+        worker_mutex[current_worker].unlock();
+        handle_epoll_ctrl(worker_epoll_fd_[current_worker], EPOLL_CTL_ADD, client_fd, client, EPOLLIN);
+        current_worker = (current_worker + 1) % ThreadPoolSize;
     }
 }
 
 void HttpServer::process_event(int worker_id) {
     int curr_epoll_fd = worker_epoll_fd_[worker_id];
     while (active_) {
-        size_t nfds = epoll_wait(curr_epoll_fd, worker_events_[worker_id], MaxEventSize, 0);
+        int nfds = epoll_wait(curr_epoll_fd, worker_events_[worker_id], MaxEventSize, KeepAliveTimeout * 1000);
         if (nfds < 0) {
             std::this_thread::sleep_for(std::chrono::microseconds(1000));
             continue;
+        }
+
+        if (nfds == 0) {
+            worker_mutex[worker_id].lock();
+            auto it = worker_connections_[worker_id].begin();
+            while (it != worker_connections_[worker_id].end()) {
+                auto now = std::chrono::steady_clock::now();
+                auto idle = std::chrono::duration_cast<std::chrono::seconds>(now - (*it)->last_active).count();
+                EventInfo *temp = *it;
+                if (idle > KeepAliveTimeout) {
+                    handle_epoll_ctrl(curr_epoll_fd, EPOLL_CTL_DEL, (*it)->fd);
+                    close((*it)->fd);
+                    it = worker_connections_[worker_id].erase(it);
+                    delete temp;
+                }
+                else {
+                    ++it;
+                }
+            }
+            worker_mutex[worker_id].unlock();
         }
 
         for (size_t i = 0; i < nfds; i++) {
             const epoll_event &curr_event = worker_events_[worker_id][i];
             struct EventInfo *data = reinterpret_cast<EventInfo*>(curr_event.data.ptr);
             if (curr_event.events & EPOLLIN || curr_event.events & EPOLLOUT) {
-                process_epoll_event(curr_epoll_fd, data, curr_event);
+                process_epoll_event(curr_epoll_fd, data, curr_event, worker_id);
             }
             else {
                 handle_epoll_ctrl(curr_epoll_fd, EPOLL_CTL_DEL, data->fd);
                 close(data->fd);
+                delete_fd(data->fd, worker_id);
                 delete data;
             }
         }
