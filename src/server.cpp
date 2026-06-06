@@ -23,33 +23,7 @@ HttpRequest parseRequest(const string& raw) {
     }
     if (r.headers["Content-Type"] == "application/json") {
         r.body = ss.str().substr(ss.tellg());
-        // cout << "raw body: " << r.body << endl;
-        bool cont = true;
-        getline(ss, line);
-        while (cont) {
-            string rest_line;
-            auto comma = line.find(',');
-            if (comma == string::npos) {
-                cont = false;
-            }
-            else {
-                rest_line = line.substr(comma + 1);
-                line = line.substr(0, comma);
-            }
-            auto colon = line.find(':');
-            if (colon == string::npos) break;
-            string key   = line.substr(0, colon);
-            string value = line.substr(colon + 1);
-
-            key.erase(remove_if(key.begin(), key.end(), [](unsigned char c) {
-                return isspace(c) || c == '"' || c == '{' || c == '}';
-            }), key.end());
-            value.erase(remove_if(value.begin(), value.end(), [](unsigned char c) {
-                return isspace(c) || c == '"' || c == '{' || c == '}';
-            }), value.end());
-            r.bodies[key] = value;
-            line = rest_line;
-        }
+        auto j = nlohmann::json::parse(r.body);
     }
     return r;
 }
@@ -99,7 +73,7 @@ EventInfo* HttpServer::handle_httpdata(EventInfo* data) {
         res.body = "{\"error\":\"Not Found\"}";
     }
     string s = res.toString(keep_alive);
-    data->write_buffer += s;
+    data->write_buffer = s;
     data->write_cursor = 0;
     return data;
 }
@@ -145,7 +119,6 @@ void HttpServer::process_epoll_event(int epfd, EventInfo *data, epoll_event ev, 
         char buf[4096];
         memset(buf, 0, sizeof(buf));
         ssize_t bytes_read = read(fd, buf, sizeof(buf));
-        // cout << "buf: " << buf << endl;
         if (bytes_read < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 handle_epoll_ctrl(epfd, EPOLL_CTL_MOD, fd, data, EPOLLIN);
@@ -166,6 +139,7 @@ void HttpServer::process_epoll_event(int epfd, EventInfo *data, epoll_event ev, 
         else {
             data->read_buffer.append(buf, bytes_read);
             data->read_cursor += bytes_read;
+            
             auto body = data->read_buffer.find("\r\n\r\n");
             if (body == string::npos) {
                 handle_epoll_ctrl(epfd, EPOLL_CTL_MOD, fd, data, EPOLLIN);
@@ -175,7 +149,6 @@ void HttpServer::process_epoll_event(int epfd, EventInfo *data, epoll_event ev, 
             auto cont = data->read_buffer.find("Content-Length: ");
             if (cont != string::npos) {
                 int content_length = stoi(data->read_buffer.substr(cont + 16));
-                // cout << "content length: " << content_length << endl;
                 if (data->read_buffer.size() - body - 4 < content_length) {
                     handle_epoll_ctrl(epfd, EPOLL_CTL_MOD, fd, data, EPOLLIN);
                     return;

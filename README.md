@@ -1,7 +1,7 @@
 # HTTP Server
 
 High-performance HTTP server built from scratch in C++17.
-Handles 189,000 requests/second with 10,000 concurrent connections.
+Handles 110,000 requests/second with 10,000 concurrent connections.
 
 ## Architecture
 - epoll-based event loop
@@ -14,7 +14,7 @@ Handles 189,000 requests/second with 10,000 concurrent connections.
 |-------------|-----------|---------|
 | 100         | 74,541    | 1.65ms  |
 | 1,000       | 105,489   | 9.27ms  |
-| 10,000      | 101,961   | 9.56ms  |
+| 10,000      | 119,161   | 9.56ms  |
 
 ## Build
 
