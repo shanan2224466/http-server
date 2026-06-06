@@ -31,5 +31,7 @@ public:
     std::string method;
     std::string path;
     std::string version;
+    std::string body;
     std::map<std::string, std::string> headers;
+    std::map<std::string, std::string> bodies;
 };

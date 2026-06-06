@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <chrono>
 #include <mutex>
+#include <../nlohmann/json.hpp>
 #include "http.hpp"
 #include "router.hpp"
 
@@ -22,13 +23,14 @@ using next_func = std::function<void()>;
 using middleware = std::function<void(const HttpRequest*, HttpRespond*, next_func)>;
 
 struct EventInfo {
-    EventInfo() : fd(0), cursor(0), total(0), keep_alive(true), last_active(std::chrono::steady_clock::now()), buffer() {}
+    EventInfo() : fd(0), read_cursor(0), write_cursor(0), keep_alive(true), last_active(std::chrono::steady_clock::now()), read_buffer(""), write_buffer("") {}
     int fd;
-    int cursor;
-    int total;
+    int read_cursor;
+    int write_cursor;
     bool keep_alive;
     std::chrono::steady_clock::time_point last_active;
-    char buffer[MaxBufferSize];
+    std::string read_buffer;
+    std::string write_buffer;
 };
 
 class HttpServer {
@@ -64,7 +66,6 @@ private:
 public:
     explicit HttpServer(const std::string& host, const int port);
     ~HttpServer() = default;
-
     HttpServer() = default;
     HttpServer(HttpServer&&) = default;
 

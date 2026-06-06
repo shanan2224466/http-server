@@ -10,11 +10,15 @@ int main() {
         res->status_text = "OK";
         res->body = "{\"message\": \"Welcome\"}";
     });
-
     server.add("GET", "/posts/:id", [](const HttpRequest* req, HttpRespond* res, auto params) {
         res->status_code = 200;
         res->status_text = "OK";
         res->body = "{\"id\": \"" + params["id"] + "\"}";
+    });
+    server.add("POST", "/posts", [](const HttpRequest* req, HttpRespond* res, auto params) {
+        res->status_code = 201;
+        res->status_text = "Created";
+        res->body = req->body;
     });
 
     server.use([](const HttpRequest* req, HttpRespond* res, next_func next) {
@@ -22,7 +26,6 @@ int main() {
         next();
         auto end = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        // std::cout << "Elapsed time: " << elapsed.count() << " ms\n";
     });
 
     server.start();

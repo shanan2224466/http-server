@@ -8,7 +8,7 @@ HttpRequest parseRequest(const string& raw) {
     ss >> r.method >> r.path >> r.version;
     // parse headers: each "Key: Value\r\n" line until the blank line
     string line;
-    getline(ss, line); // consume rest of request-line
+    getline(ss, line);
     while (getline(ss, line)) {
         if (line == "\r" || line.empty()) break;
         auto colon = line.find(':');
@@ -21,10 +21,40 @@ HttpRequest parseRequest(const string& raw) {
         if (!value.empty() && value.back() == '\r') value.pop_back();
         r.headers[key] = value;
     }
+    if (r.headers["Content-Type"] == "application/json") {
+        r.body = ss.str().substr(ss.tellg());
+        // cout << "raw body: " << r.body << endl;
+        bool cont = true;
+        getline(ss, line);
+        while (cont) {
+            string rest_line;
+            auto comma = line.find(',');
+            if (comma == string::npos) {
+                cont = false;
+            }
+            else {
+                rest_line = line.substr(comma + 1);
+                line = line.substr(0, comma);
+            }
+            auto colon = line.find(':');
+            if (colon == string::npos) break;
+            string key   = line.substr(0, colon);
+            string value = line.substr(colon + 1);
+
+            key.erase(remove_if(key.begin(), key.end(), [](unsigned char c) {
+                return isspace(c) || c == '"' || c == '{' || c == '}';
+            }), key.end());
+            value.erase(remove_if(value.begin(), value.end(), [](unsigned char c) {
+                return isspace(c) || c == '"' || c == '{' || c == '}';
+            }), value.end());
+            r.bodies[key] = value;
+            line = rest_line;
+        }
+    }
     return r;
 }
 
-HttpServer::HttpServer(const std::string& host, const int port)
+HttpServer::HttpServer(const string& host, const int port)
     : port_(port)
     , host_(host)
     , socket_fd_(0)
@@ -38,7 +68,7 @@ void HttpServer::use(middleware middle) {
     middlewares_.push_back(middle);
 }
 
-void HttpServer::execution_chain(int index, const HttpRequest* req, HttpRespond* res, const route_handler& handler, std::unordered_map<std::string, std::string>& params) {
+void HttpServer::execution_chain(int index, const HttpRequest* req, HttpRespond* res, const route_handler& handler, unordered_map<string, string>& params) {
     if (index == middlewares_.size()) {
         handler(req, res, params);
     }
@@ -50,9 +80,9 @@ void HttpServer::execution_chain(int index, const HttpRequest* req, HttpRespond*
 }
 
 EventInfo* HttpServer::handle_httpdata(EventInfo* data) {
-    HttpRequest req = parseRequest(data->buffer);
+    HttpRequest req = parseRequest(data->read_buffer);
     Route matched;
-    std::unordered_map<std::string, std::string> params;
+    unordered_map<string, string> params;
 
     // honour Connection: close sent by client
     auto conn_it = req.headers.find("Connection");
@@ -69,13 +99,12 @@ EventInfo* HttpServer::handle_httpdata(EventInfo* data) {
         res.body = "{\"error\":\"Not Found\"}";
     }
     string s = res.toString(keep_alive);
-    strncpy(data->buffer, s.c_str(), MaxBufferSize - data->total - 1);
-    data->buffer[MaxBufferSize - 1] = '\0';
-    data->total += s.size();
+    data->write_buffer += s;
+    data->write_cursor = 0;
     return data;
 }
 
-void HttpServer::add(const std::string& method, const std::string& pattern, const route_handler& call_back) {
+void HttpServer::add(const string& method, const string& pattern, const route_handler& call_back) {
     router_.add(method, pattern, call_back);
 }
 
@@ -111,13 +140,14 @@ void HttpServer::handle_epoll_ctrl(int epfd, int op, int fd, void* info, uint32_
 
 void HttpServer::process_epoll_event(int epfd, EventInfo *data, epoll_event ev, int worker_id) {
     int fd = data->fd;
-    cout << "Request on fd = " << fd << endl;
-    data->last_active = std::chrono::steady_clock::now();
+    data->last_active = chrono::steady_clock::now();
     if (ev.events & EPOLLIN) {
-        ssize_t bytes_read = read(fd, data->buffer + data->cursor, MaxBufferSize - 1);
+        char buf[4096];
+        memset(buf, 0, sizeof(buf));
+        ssize_t bytes_read = read(fd, buf, sizeof(buf));
+        // cout << "buf: " << buf << endl;
         if (bytes_read < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                data->fd = fd;
                 handle_epoll_ctrl(epfd, EPOLL_CTL_MOD, fd, data, EPOLLIN);
             }
             else {
@@ -134,30 +164,49 @@ void HttpServer::process_epoll_event(int epfd, EventInfo *data, epoll_event ev, 
             delete data;
         }
         else {
+            data->read_buffer.append(buf, bytes_read);
+            data->read_cursor += bytes_read;
+            auto body = data->read_buffer.find("\r\n\r\n");
+            if (body == string::npos) {
+                handle_epoll_ctrl(epfd, EPOLL_CTL_MOD, fd, data, EPOLLIN);
+                return;
+            }
+
+            auto cont = data->read_buffer.find("Content-Length: ");
+            if (cont != string::npos) {
+                int content_length = stoi(data->read_buffer.substr(cont + 16));
+                // cout << "content length: " << content_length << endl;
+                if (data->read_buffer.size() - body - 4 < content_length) {
+                    handle_epoll_ctrl(epfd, EPOLL_CTL_MOD, fd, data, EPOLLIN);
+                    return;
+                }
+            }
             data = handle_httpdata(data);
-            
             handle_epoll_ctrl(epfd, EPOLL_CTL_MOD, fd, data, EPOLLOUT);
+            data->read_buffer.clear();
+            data->read_cursor = 0;
         }
     }
     else if (ev.events & EPOLLOUT) {
-        ssize_t bytes_written = write(fd, data->buffer + data->cursor, data->total);
-        if (data->total > bytes_written) {
-            data->cursor += bytes_written;
-            data->total -= bytes_written;
+        size_t remain = data->write_buffer.size() - data->write_cursor;
+        ssize_t bytes_written = write(fd, data->write_buffer.c_str() + data->write_cursor, remain);
+        if (remain > bytes_written) {
+            data->write_cursor += bytes_written;
             handle_epoll_ctrl(epfd, EPOLL_CTL_MOD, fd, data, EPOLLOUT);
         }
-        else if (data->total == bytes_written) {
+        else if (remain == bytes_written) {
             if (!data->keep_alive) {
                 handle_epoll_ctrl(epfd, EPOLL_CTL_DEL, fd);
                 close(fd);
                 delete_fd(fd, worker_id);
                 delete data;
             } else {
-                data->cursor = 0;
-                data->total = 0;
+                data->read_cursor = 0;
+                data->write_cursor = 0;
+                data->read_buffer.clear();
+                data->write_buffer.clear();
                 data->keep_alive = true;
-                data->last_active = std::chrono::steady_clock::now();
-                memset(data->buffer, 0, MaxBufferSize);
+                data->last_active = chrono::steady_clock::now();
                 handle_epoll_ctrl(epfd, EPOLL_CTL_MOD, fd, data, EPOLLIN);
             }
         }
@@ -182,9 +231,8 @@ void HttpServer::server_listen() {
 
     while (active_) {
         int client_fd = accept(socket_fd_, (sockaddr *)&client_addr, &client_addr_len);
-        cout << "New connection: fd = " << client_fd << endl;
         if (client_fd < 0) {
-            std::this_thread::sleep_for(std::chrono::microseconds(1000));
+            this_thread::sleep_for(chrono::microseconds(1000));
             continue;
         }
 
@@ -203,7 +251,7 @@ void HttpServer::process_event(int worker_id) {
     while (active_) {
         int nfds = epoll_wait(curr_epoll_fd, worker_events_[worker_id], MaxEventSize, KeepAliveTimeout * 1000);
         if (nfds < 0) {
-            std::this_thread::sleep_for(std::chrono::microseconds(1000));
+            this_thread::sleep_for(chrono::microseconds(1000));
             continue;
         }
 
@@ -211,8 +259,8 @@ void HttpServer::process_event(int worker_id) {
             worker_mutex[worker_id].lock();
             auto it = worker_connections_[worker_id].begin();
             while (it != worker_connections_[worker_id].end()) {
-                auto now = std::chrono::steady_clock::now();
-                auto idle = std::chrono::duration_cast<std::chrono::seconds>(now - (*it)->last_active).count();
+                auto now = chrono::steady_clock::now();
+                auto idle = chrono::duration_cast<chrono::seconds>(now - (*it)->last_active).count();
                 EventInfo *temp = *it;
                 if (idle > KeepAliveTimeout) {
                     handle_epoll_ctrl(curr_epoll_fd, EPOLL_CTL_DEL, (*it)->fd);
@@ -246,7 +294,7 @@ void HttpServer::process_event(int worker_id) {
 void HttpServer::setup_server() {
     socket_fd_ = socket(AF_INET, SOCK_STREAM, 0);
     if (socket_fd_ < 0) {
-        throw std::runtime_error("socket created fail.");
+        throw runtime_error("socket created fail.");
     }
 
     memset(&server_info_, 0, sizeof(server_info_));
@@ -257,16 +305,16 @@ void HttpServer::setup_server() {
 
     int opt = 1;
     if (setsockopt(socket_fd_, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt)) < 0) {
-        throw std::runtime_error("setsockopt fail");
+        throw runtime_error("setsockopt fail");
     }
 
     if (bind(socket_fd_, (const struct sockaddr*) &server_info_, sizeof(server_info_)) < 0) {
         close(socket_fd_);
-        throw std::runtime_error("bind fail");
+        throw runtime_error("bind fail");
     }
 
     if (listen(socket_fd_, 1024) < 0) {
-        throw std::runtime_error("listen fail");
+        throw runtime_error("listen fail");
     }
 }
 
@@ -279,9 +327,9 @@ void HttpServer::start() {
         }
     }
 
-    listen_thread_ = std::thread(&HttpServer::server_listen, this);
+    listen_thread_ = thread(&HttpServer::server_listen, this);
     for (size_t i = 0; i < ThreadPoolSize; i++) {
-        worker_thread_[i] = std::thread(&HttpServer::process_event, this, i);
+        worker_thread_[i] = thread(&HttpServer::process_event, this, i);
     }
 }
 
