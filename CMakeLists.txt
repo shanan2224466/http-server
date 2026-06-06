@@ -5,7 +5,7 @@ set(BINARY server)
 set(CMAKE_CXX_STANDARD 17)
 include_directories(
     src
-    include
+    nlohmann
 )
 add_executable(server
     src/main.cpp

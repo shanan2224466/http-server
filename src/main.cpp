@@ -20,6 +20,11 @@ int main() {
         res->status_text = "Created";
         res->body = req->body;
     });
+    server.add("GET", "/static/.*", [&server](const HttpRequest* req, HttpRespond* res, auto params) {
+        server.serve_file(req, res);
+    });
+
+    server.set_static_dir("/app/static");
 
     server.use([](const HttpRequest* req, HttpRespond* res, next_func next) {
         auto start = std::chrono::steady_clock::now();

@@ -2,6 +2,7 @@
 
 #include <thread>
 #include <iostream>
+#include <fstream>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <cstring>
@@ -13,7 +14,7 @@
 #include <unordered_map>
 #include <chrono>
 #include <mutex>
-#include <../nlohmann/json.hpp>
+#include <json.hpp>
 #include "http.hpp"
 #include "router.hpp"
 
@@ -40,6 +41,7 @@ private:
 
     std::uint16_t port_;
     std::string host_;
+    std::string static_dir_;
     int socket_fd_;
     sockaddr_in server_info_;
     bool active_;
@@ -50,6 +52,9 @@ private:
 
     void execution_chain(int index, const HttpRequest* req, HttpRespond* res, 
     const route_handler& handler, std::unordered_map<std::string, std::string>& params);
+    bool check_path_exist(const std::string& path);
+    bool check_path_legal(const std::string& path);
+    std::string get_content_type(const std::string &path);
     EventInfo* handle_httpdata(EventInfo *data);
     void server_listen(void);
     void process_epoll_event(int epfd, EventInfo *data, epoll_event ev, int worker_id);
@@ -72,6 +77,8 @@ public:
     void start();
     void stop();
     void use(middleware middle);
+    void set_static_dir(const std::string& dir) { static_dir_ = dir; }
+    void serve_file(const HttpRequest* req, HttpRespond* res);
     void add(const std::string& method, const std::string& pattern, const route_handler& call_back);
     std::uint16_t get_port() const {return port_;}
     std::string get_host() const {return host_;}

@@ -8,11 +8,12 @@ class HttpRespond {
 public:
     int status_code;
     std::string status_text;
+    std::string content_type;
     std::string body;
 
     std::string toString(bool keep_alive = true) const {
         std::string response = "HTTP/1.1 " + std::to_string(status_code) + " " + status_text + "\r\n";
-        response += "Content-Type: application/json\r\n";
+        response += "Content-Type: " + content_type + "\r\n";
         response += "Content-Length: " + std::to_string(body.size()) + "\r\n";
         if (keep_alive) {
             response += "Connection: keep-alive\r\n";
