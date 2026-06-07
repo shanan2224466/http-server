@@ -14,7 +14,6 @@
 #include <unordered_map>
 #include <chrono>
 #include <mutex>
-#include <json.hpp>
 #include "http.hpp"
 #include "router.hpp"
 
@@ -24,9 +23,8 @@ using next_func = std::function<void()>;
 using middleware = std::function<void(const HttpRequest*, HttpRespond*, next_func)>;
 
 struct EventInfo {
-    EventInfo() : fd(0), read_cursor(0), write_cursor(0), keep_alive(true), last_active(std::chrono::steady_clock::now()), read_buffer(""), write_buffer("") {}
+    EventInfo() : fd(0), write_cursor(0), keep_alive(true), last_active(std::chrono::steady_clock::now()) {}
     int fd;
-    int read_cursor;
     int write_cursor;
     bool keep_alive;
     std::chrono::steady_clock::time_point last_active;

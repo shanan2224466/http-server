@@ -8,7 +8,7 @@ class HttpRespond {
 public:
     int status_code;
     std::string status_text;
-    std::string content_type;
+    std::string content_type = "application/json";
     std::string body;
 
     std::string toString(bool keep_alive = true) const {
@@ -34,5 +34,4 @@ public:
     std::string version;
     std::string body;
     std::map<std::string, std::string> headers;
-    std::map<std::string, std::string> bodies;
 };

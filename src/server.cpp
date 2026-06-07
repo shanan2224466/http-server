@@ -1,4 +1,6 @@
 #include "server.hpp"
+#include <algorithm>
+#include <json.hpp>
 
 using namespace std;
 
@@ -21,9 +23,8 @@ HttpRequest parseRequest(const string& raw) {
         if (!value.empty() && value.back() == '\r') value.pop_back();
         r.headers[key] = value;
     }
-    if (r.headers["Content-Type"] == "application/json") {
+    if (r.headers.count("Content-Length")) {
         r.body = ss.str().substr(ss.tellg());
-        auto j = nlohmann::json::parse(r.body);
     }
     return r;
 }
@@ -77,7 +78,7 @@ bool HttpServer::check_path_legal(const string& path) {
         auto user_it = resolved_path.begin();
         for (; base_it != resolved_base.end(); ++base_it, ++user_it) {
             if (user_it == resolved_path.end() || *base_it != *user_it) {
-                return false; 
+                return false;
             }
         }
         return true;
@@ -100,7 +101,7 @@ string HttpServer::get_content_type(const string &path) {
             return "application/javascript";
         if (extension == "css")
             return "text/css";
-        if (extension == "jpg" || extension == "jpg")
+        if (extension == "jpg" || extension == "jpeg")
             return "image/jpeg";
         if (extension == "gif")
             return "image/gif";
@@ -139,15 +140,15 @@ void HttpServer::serve_file(const HttpRequest* req, HttpRespond* res) {
             res->status_code = 403;
             res->status_text = "Forbidden";
             res->body = "{\"error\":\"Forbidden\"}";
+        } else {
+            res->content_type = get_content_type(req->path);
+            res->body = string(
+                istreambuf_iterator<char>(file),
+                istreambuf_iterator<char>()
+            );
+            res->status_code = 200;
+            res->status_text = "OK";
         }
-        res->content_type = get_content_type(req->path);
-
-        res->body = string(
-            istreambuf_iterator<char>(file),
-            istreambuf_iterator<char>()
-        );
-        res->status_code = 200;
-        res->status_text = "OK";
     }
 }
 
@@ -181,17 +182,12 @@ void HttpServer::add(const string& method, const string& pattern, const route_ha
 }
 
 void HttpServer::delete_fd(int fd, int worker_id) {
-    worker_mutex[worker_id].lock();
-    auto it = worker_connections_[worker_id].begin();
-    while (it != worker_connections_[worker_id].end()) {
-        if ((*it)->fd == fd) {
-            it = worker_connections_[worker_id].erase(it);
-        }
-        else {
-            ++it;
-        }
-    }
-    worker_mutex[worker_id].unlock();
+    lock_guard<mutex> lock(worker_mutex[worker_id]);
+    auto& conns = worker_connections_[worker_id];
+    conns.erase(
+        remove_if(conns.begin(), conns.end(), [fd](EventInfo* e) { return e->fd == fd; }),
+        conns.end()
+    );
 }
 
 void HttpServer::handle_epoll_ctrl(int epfd, int op, int fd, void* info, uint32_t event_type) {
@@ -236,7 +232,6 @@ void HttpServer::process_epoll_event(int epfd, EventInfo *data, epoll_event ev, 
         }
         else {
             data->read_buffer.append(buf, bytes_read);
-            data->read_cursor += bytes_read;
             
             auto body = data->read_buffer.find("\r\n\r\n");
             if (body == string::npos) {
@@ -255,24 +250,29 @@ void HttpServer::process_epoll_event(int epfd, EventInfo *data, epoll_event ev, 
             data = handle_httpdata(data);
             handle_epoll_ctrl(epfd, EPOLL_CTL_MOD, fd, data, EPOLLOUT);
             data->read_buffer.clear();
-            data->read_cursor = 0;
         }
     }
     else if (ev.events & EPOLLOUT) {
         size_t remain = data->write_buffer.size() - data->write_cursor;
         ssize_t bytes_written = write(fd, data->write_buffer.c_str() + data->write_cursor, remain);
-        if (remain > bytes_written) {
+        if (bytes_written < 0) {
+            handle_epoll_ctrl(epfd, EPOLL_CTL_DEL, fd);
+            close(fd);
+            delete_fd(fd, worker_id);
+            delete data;
+            if (errno != ECONNRESET) cerr << "write error: " << strerror(errno) << endl;
+        }
+        else if (static_cast<size_t>(bytes_written) < remain) {
             data->write_cursor += bytes_written;
             handle_epoll_ctrl(epfd, EPOLL_CTL_MOD, fd, data, EPOLLOUT);
         }
-        else if (remain == bytes_written) {
+        else {
             if (!data->keep_alive) {
                 handle_epoll_ctrl(epfd, EPOLL_CTL_DEL, fd);
                 close(fd);
                 delete_fd(fd, worker_id);
                 delete data;
             } else {
-                data->read_cursor = 0;
                 data->write_cursor = 0;
                 data->read_buffer.clear();
                 data->write_buffer.clear();
@@ -280,12 +280,6 @@ void HttpServer::process_epoll_event(int epfd, EventInfo *data, epoll_event ev, 
                 data->last_active = chrono::steady_clock::now();
                 handle_epoll_ctrl(epfd, EPOLL_CTL_MOD, fd, data, EPOLLIN);
             }
-        }
-        else {
-            handle_epoll_ctrl(epfd, EPOLL_CTL_DEL, fd);
-            close(fd);
-            delete_fd(fd, worker_id);
-            delete data;
         }
     }
     else {
@@ -391,7 +385,7 @@ void HttpServer::setup_server() {
 
 void HttpServer::start() {
     active_ = true;
-    HttpServer::setup_server();
+    setup_server();
     for (int i = 0; i < ThreadPoolSize; i++) {
         if ((worker_epoll_fd_[i] = epoll_create1(0)) < 0) {
             throw runtime_error("epoll created fail.");

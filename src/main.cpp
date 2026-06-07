@@ -29,8 +29,9 @@ int main() {
     server.use([](const HttpRequest* req, HttpRespond* res, next_func next) {
         auto start = std::chrono::steady_clock::now();
         next();
-        auto end = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
+        std::cout << req->method << " " << req->path << " " << elapsed.count() << "ms\n";
     });
 
     server.start();
