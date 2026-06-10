@@ -1,46 +1,31 @@
 #include "server.hpp"
+#include "http_parse.hpp"
 #include <algorithm>
 #include <json.hpp>
 
 using namespace std;
 
-HttpRequest parseRequest(const string& raw) {
-    HttpRequest r;
-    stringstream ss(raw);
-    ss >> r.method >> r.path >> r.version;
-    // parse headers: each "Key: Value\r\n" line until the blank line
-    string line;
-    getline(ss, line);
-    while (getline(ss, line)) {
-        if (line == "\r" || line.empty()) break;
-        auto colon = line.find(':');
-        if (colon == string::npos) continue;
-        string key   = line.substr(0, colon);
-        string value = line.substr(colon + 1);
-        // trim leading spaces and trailing \r
-        auto start = value.find_first_not_of(' ');
-        if (start != string::npos) value = value.substr(start);
-        if (!value.empty() && value.back() == '\r') value.pop_back();
-        r.headers[key] = value;
-    }
-    if (r.headers.count("Content-Length")) {
-        r.body = ss.str().substr(ss.tellg());
-    }
-    return r;
-}
-
-HttpServer::HttpServer(const string& host, const int port)
-    : port_(port)
+HttpServer::HttpServer(const string& host, const int port, ServerConfig cfg = {})
+    : cfg_(cfg)
+    , active_connections_(0)
+    , port_(port)
     , host_(host)
     , static_dir_("")
     , socket_fd_(0)
     , server_info_()
     , active_(false)
     , router_()
-    , worker_mutex()
+    , worker_mutex_()
     , middlewares_()
     , worker_connections_()
-    {}
+    {
+        int n = cfg_.thread_pool_size;
+        worker_mutex_ = std::vector<std::mutex>(n);
+        worker_connections_.assign(n, std::vector<EventInfo*>());
+        worker_epoll_fd_.resize(n);
+        worker_events_.assign(n, std::vector<epoll_event>(cfg_.max_connections));
+        worker_thread_.resize(n);
+    }
 
 void HttpServer::use(middleware middle) {
     if (active_) throw runtime_error("call use() after start().");
@@ -58,102 +43,11 @@ void HttpServer::execution_chain(int index, const HttpRequest* req, HttpRespond*
     }
 }
 
-bool HttpServer::check_path_exist(const string& path) {
-    try {
-        filesystem::path resolved_path = filesystem::canonical(path);
-        return filesystem::exists(resolved_path);
-    }
-    catch (const filesystem::filesystem_error& e) {
-        cerr << "filesystem error: " << e.what() << endl;
-        return false;
-    }
-}
-
-bool HttpServer::check_path_legal(const string& path) {
-    try {
-        filesystem::path resolved_path = filesystem::canonical(path);
-        filesystem::path resolved_base = filesystem::canonical(static_dir_);
-
-        auto base_it = resolved_base.begin();
-        auto user_it = resolved_path.begin();
-        for (; base_it != resolved_base.end(); ++base_it, ++user_it) {
-            if (user_it == resolved_path.end() || *base_it != *user_it) {
-                return false;
-            }
-        }
-        return true;
-    }
-    catch (const filesystem::filesystem_error& e) {
-        cerr << "filesystem error: " << e.what() << endl;
-        return false;
-    }
-}
-
-string HttpServer::get_content_type(const string &path) {
-    const size_t pos = path.find_last_of(".");
-    if (pos != string::npos) {
-        const string extension = path.substr(pos + 1);
-        if(extension == "html" || extension == "htm" || extension == "shtml")
-            return "text/html";
-        if (extension == "json")
-            return "application/json";
-        if (extension == "js")
-            return "application/javascript";
-        if (extension == "css")
-            return "text/css";
-        if (extension == "jpg" || extension == "jpeg")
-            return "image/jpeg";
-        if (extension == "gif")
-            return "image/gif";
-        if (extension == "ico")
-            return "image/x-icon";
-        if (extension == "png")
-            return "image/png";
-        if (extension == "svg" || extension == "svgz")
-            return "image/svg+xml";
-    }
-    return "application/octet-stream";
-}
-
-void HttpServer::serve_file(const HttpRequest* req, HttpRespond* res) {
-    auto pos = req->path.find("/static");
-    string full_path = static_dir_ + req->path.substr(pos + 7);
-
-    if (!check_path_legal(full_path)) {
-        res->status_code = 403;
-        res->status_text = "Forbidden";
-        res->body = "{\"error\":\"Forbidden\"}";
-    }
-    else if (!check_path_exist(full_path)) {
-        res->status_code = 404;
-        res->status_text = "Not Found";
-        res->body = "{\"error\":\"Not Found\"}";
-    }
-    else if (access(full_path.c_str(), R_OK) != 0) {
-        res->status_code = 403;
-        res->status_text = "Forbidden";
-        res->body = "{\"error\":\"Forbidden\"}";
-    }
-    else {
-        ifstream file(full_path, ios::binary);
-        if (!file.is_open()) {
-            res->status_code = 403;
-            res->status_text = "Forbidden";
-            res->body = "{\"error\":\"Forbidden\"}";
-        } else {
-            res->content_type = get_content_type(req->path);
-            res->body = string(
-                istreambuf_iterator<char>(file),
-                istreambuf_iterator<char>()
-            );
-            res->status_code = 200;
-            res->status_text = "OK";
-        }
-    }
-}
-
 EventInfo* HttpServer::handle_httpdata(EventInfo* data) {
     HttpRequest req = parseRequest(data->read_buffer);
+    if (req.headers["Content-Length"] != "" && stoi(req.headers["Content-Length"]) < req.body.size()) {
+        return NULL;
+    }
     Route matched;
     unordered_map<string, string> params;
 
@@ -167,9 +61,7 @@ EventInfo* HttpServer::handle_httpdata(EventInfo* data) {
         execution_chain(0, &req, &res, matched.handler, params);
     }
     else {
-        res.status_code = 404;
-        res.status_text = "Not Found";
-        res.body = "{\"error\":\"Not Found\"}";
+        res = make_error(404, "Not Found", "Not Found");
     }
     string s = res.toString(keep_alive);
     data->write_buffer = s;
@@ -181,13 +73,17 @@ void HttpServer::add(const string& method, const string& pattern, const route_ha
     router_.add(method, pattern, call_back);
 }
 
-void HttpServer::delete_fd(int fd, int worker_id) {
-    lock_guard<mutex> lock(worker_mutex[worker_id]);
+void HttpServer::close_connection(int epfd, EventInfo* data, int worker_id) {
+    handle_epoll_ctrl(epfd, EPOLL_CTL_DEL, data->fd);
+    close(data->fd);
+    lock_guard<mutex> lock(worker_mutex_[worker_id]);
     auto& conns = worker_connections_[worker_id];
-    conns.erase(
-        remove_if(conns.begin(), conns.end(), [fd](EventInfo* e) { return e->fd == fd; }),
-        conns.end()
-    );
+    auto it = find(conns.begin(), conns.end(), data);
+    if (it != conns.end()) {
+        delete *it;
+        conns.erase(it);
+        active_connections_--;
+    }
 }
 
 void HttpServer::handle_epoll_ctrl(int epfd, int op, int fd, void* info, uint32_t event_type) {
@@ -218,17 +114,12 @@ void HttpServer::process_epoll_event(int epfd, EventInfo *data, epoll_event ev, 
                 handle_epoll_ctrl(epfd, EPOLL_CTL_MOD, fd, data, EPOLLIN);
             }
             else {
-                close(fd);
-                delete_fd(fd, worker_id);
-                delete data;
+                close_connection(epfd, data, worker_id);
                 if (errno != ECONNRESET) cerr << "read error: " << strerror(errno) << endl;
             }
         }
         else if (bytes_read == 0) {
-            handle_epoll_ctrl(epfd, EPOLL_CTL_DEL, fd);
-            close(fd);
-            delete_fd(fd, worker_id);
-            delete data;
+            close_connection(epfd, data, worker_id);
         }
         else {
             data->read_buffer.append(buf, bytes_read);
@@ -239,28 +130,27 @@ void HttpServer::process_epoll_event(int epfd, EventInfo *data, epoll_event ev, 
                 return;
             }
 
-            auto cont = data->read_buffer.find("Content-Length: ");
-            if (cont != string::npos) {
-                int content_length = stoi(data->read_buffer.substr(cont + 16));
-                if (data->read_buffer.size() - body - 4 < content_length) {
-                    handle_epoll_ctrl(epfd, EPOLL_CTL_MOD, fd, data, EPOLLIN);
-                    return;
-                }
-            }
             data = handle_httpdata(data);
-            handle_epoll_ctrl(epfd, EPOLL_CTL_MOD, fd, data, EPOLLOUT);
-            data->read_buffer.clear();
+            if (data == NULL) {
+                handle_epoll_ctrl(epfd, EPOLL_CTL_MOD, fd, data, EPOLLIN);
+            }
+            else {
+                handle_epoll_ctrl(epfd, EPOLL_CTL_MOD, fd, data, EPOLLOUT);
+                data->read_buffer.clear();
+            }
         }
     }
     else if (ev.events & EPOLLOUT) {
         size_t remain = data->write_buffer.size() - data->write_cursor;
         ssize_t bytes_written = write(fd, data->write_buffer.c_str() + data->write_cursor, remain);
         if (bytes_written < 0) {
-            handle_epoll_ctrl(epfd, EPOLL_CTL_DEL, fd);
-            close(fd);
-            delete_fd(fd, worker_id);
-            delete data;
-            if (errno != ECONNRESET) cerr << "write error: " << strerror(errno) << endl;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                handle_epoll_ctrl(epfd, EPOLL_CTL_MOD, fd, data, EPOLLOUT);
+            }
+            else {
+                close_connection(epfd, data, worker_id);
+                if (errno != ECONNRESET) cerr << "write error: " << strerror(errno) << endl;
+            }
         }
         else if (static_cast<size_t>(bytes_written) < remain) {
             data->write_cursor += bytes_written;
@@ -268,10 +158,7 @@ void HttpServer::process_epoll_event(int epfd, EventInfo *data, epoll_event ev, 
         }
         else {
             if (!data->keep_alive) {
-                handle_epoll_ctrl(epfd, EPOLL_CTL_DEL, fd);
-                close(fd);
-                delete_fd(fd, worker_id);
-                delete data;
+                close_connection(epfd, data, worker_id);
             } else {
                 data->write_cursor = 0;
                 data->read_buffer.clear();
@@ -283,9 +170,7 @@ void HttpServer::process_epoll_event(int epfd, EventInfo *data, epoll_event ev, 
         }
     }
     else {
-        close(fd);
-        delete_fd(fd, worker_id);
-        delete data;
+        close_connection(epfd, data, worker_id);
     }
 }
 
@@ -296,48 +181,54 @@ void HttpServer::server_listen() {
 
     while (active_) {
         int client_fd = accept(socket_fd_, (sockaddr *)&client_addr, &client_addr_len);
-        if (client_fd < 0) {
+        if (active_connections_ > cfg_.max_connections || client_fd < 0) {
             this_thread::sleep_for(chrono::microseconds(1000));
             continue;
         }
 
         EventInfo *client = new EventInfo();
         client->fd = client_fd;
-        worker_mutex[current_worker].lock();
+        lock_guard<mutex> lock(worker_mutex_[current_worker]);
         worker_connections_[current_worker].push_back(client);
-        worker_mutex[current_worker].unlock();
         handle_epoll_ctrl(worker_epoll_fd_[current_worker], EPOLL_CTL_ADD, client_fd, client, EPOLLIN);
-        current_worker = (current_worker + 1) % ThreadPoolSize;
+        current_worker = (current_worker + 1) % cfg_.thread_pool_size;
+        active_connections_++;
     }
 }
 
 void HttpServer::process_event(int worker_id) {
     int curr_epoll_fd = worker_epoll_fd_[worker_id];
     while (active_) {
-        int nfds = epoll_wait(curr_epoll_fd, worker_events_[worker_id], MaxEventSize, KeepAliveTimeout * 1000);
+        int nfds = epoll_wait(curr_epoll_fd, worker_events_[worker_id].data(), cfg_.max_connections, cfg_.keepalive_timeout_s * 1000);
         if (nfds < 0) {
             this_thread::sleep_for(chrono::microseconds(1000));
             continue;
         }
 
         if (nfds == 0) {
-            worker_mutex[worker_id].lock();
-            auto it = worker_connections_[worker_id].begin();
-            while (it != worker_connections_[worker_id].end()) {
-                auto now = chrono::steady_clock::now();
-                auto idle = chrono::duration_cast<chrono::seconds>(now - (*it)->last_active).count();
-                EventInfo *temp = *it;
-                if (idle > KeepAliveTimeout) {
-                    handle_epoll_ctrl(curr_epoll_fd, EPOLL_CTL_DEL, (*it)->fd);
-                    close((*it)->fd);
-                    it = worker_connections_[worker_id].erase(it);
-                    delete temp;
-                }
-                else {
-                    ++it;
+            vector<EventInfo*> del;
+            {
+                lock_guard<mutex> lock(worker_mutex_[worker_id]);
+                auto it = worker_connections_[worker_id].begin();
+                while (it != worker_connections_[worker_id].end()) {
+                    auto now = chrono::steady_clock::now();
+                    auto idle = chrono::duration_cast<chrono::seconds>(now - (*it)->last_active).count();
+                    if (idle > cfg_.keepalive_timeout_s) {
+                        del.push_back(*it);
+                        it = worker_connections_[worker_id].erase(it);
+                    }
+                    else {
+                        ++it;
+                    }
                 }
             }
-            worker_mutex[worker_id].unlock();
+            for (auto& c : del) {
+                handle_epoll_ctrl(curr_epoll_fd, EPOLL_CTL_DEL, c->fd);
+                close(c->fd);
+                delete c;
+                active_connections_--;
+            }
+            continue;
         }
 
         for (size_t i = 0; i < nfds; i++) {
@@ -347,10 +238,7 @@ void HttpServer::process_event(int worker_id) {
                 process_epoll_event(curr_epoll_fd, data, curr_event, worker_id);
             }
             else {
-                handle_epoll_ctrl(curr_epoll_fd, EPOLL_CTL_DEL, data->fd);
-                close(data->fd);
-                delete_fd(data->fd, worker_id);
-                delete data;
+                close_connection(curr_epoll_fd, data, worker_id);
             }
         }
     }
@@ -386,14 +274,14 @@ void HttpServer::setup_server() {
 void HttpServer::start() {
     active_ = true;
     setup_server();
-    for (int i = 0; i < ThreadPoolSize; i++) {
+    for (int i = 0; i < cfg_.thread_pool_size; i++) {
         if ((worker_epoll_fd_[i] = epoll_create1(0)) < 0) {
             throw runtime_error("epoll created fail.");
         }
     }
 
     listen_thread_ = thread(&HttpServer::server_listen, this);
-    for (size_t i = 0; i < ThreadPoolSize; i++) {
+    for (size_t i = 0; i < cfg_.thread_pool_size; i++) {
         worker_thread_[i] = thread(&HttpServer::process_event, this, i);
     }
 }
@@ -401,7 +289,7 @@ void HttpServer::start() {
 void HttpServer::stop() {
     active_ = false;
     listen_thread_.join();
-    for (int i = 0; i < ThreadPoolSize; i++) {
+    for (int i = 0; i < cfg_.thread_pool_size; i++) {
         worker_thread_[i].join();
         close(worker_epoll_fd_[i]);
     }

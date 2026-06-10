@@ -11,6 +11,8 @@ add_executable(server
     src/main.cpp
     src/server.cpp
     src/router.cpp
+    src/http_parse.cpp
+    src/file_server.cpp
 )
 
 find_package(GTest REQUIRED)
@@ -18,7 +20,9 @@ enable_testing()
 
 add_executable(tests
     test/router_test.cpp
+    test/parse_test.cpp
     src/router.cpp
+    src/http_parse.cpp
 )
 
 target_link_libraries(tests GTest::gtest_main)

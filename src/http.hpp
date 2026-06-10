@@ -8,7 +8,7 @@ class HttpRespond {
 public:
     int status_code;
     std::string status_text;
-    std::string content_type = "application/json";
+    std::string content_type;
     std::string body;
 
     std::string toString(bool keep_alive = true) const {
@@ -26,6 +26,15 @@ public:
         return response;
     }
 };
+
+inline HttpRespond make_error(int code, const std::string& text, const std::string& msg) {
+    HttpRespond r;
+    r.status_code = code;
+    r.status_text = text;
+    r.content_type = "application/json";
+    r.body = "{\"error\":\"" + msg + "\"}";
+    return r;
+}
 
 class HttpRequest {
 public:

@@ -1,10 +1,11 @@
 #include <string>
 #include "server.hpp"
+#include "file_server.hpp"
 
 int main() {
     std::string host = "0.0.0.0";
     int port = 8080;
-    HttpServer server(host, port);
+    HttpServer server(host, port, ServerConfig{.thread_pool_size = 5, .max_connections = 10000, .keepalive_timeout_s = 5});
     server.add("GET", "/", [](const HttpRequest* req, HttpRespond* res, auto params) {
         res->status_code = 200;
         res->status_text = "OK";
@@ -21,7 +22,7 @@ int main() {
         res->body = req->body;
     });
     server.add("GET", "/static/.*", [&server](const HttpRequest* req, HttpRespond* res, auto params) {
-        server.serve_file(req, res);
+        serve_file(req, res, server.get_static_dir());
     });
 
     server.set_static_dir("/app/static");
